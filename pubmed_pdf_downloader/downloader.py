@@ -6,6 +6,8 @@ from bs4 import BeautifulSoup
 import re
 import urllib
 import time
+import tarfile
+import io
 
 # code heavily taken from: https://github.com/billgreenwald/Pubmed-Batch-Download
 
@@ -13,30 +15,53 @@ def get_main_url(url):
     return "/".join(url.split("/")[:3])
 
 def save_pdf_from_url(pdf_url, directory, name, headers):
+    """Download a PDF from the given URL and save it. Returns True on success, False on failure."""
     try:
-        response = requests.get(pdf_url, headers=headers, allow_redirects=True)
+        # Handle OA tar.gz archives
+        if pdf_url.startswith('oa_tgz:'):
+            return _save_pdf_from_tgz(pdf_url[7:], directory, name, headers)
+
+        response = requests.get(pdf_url, headers=headers, allow_redirects=True, timeout=30)
         response.raise_for_status()
-        
+
         # Check if content is actually a PDF
         if not response.content.startswith(b'%PDF'):
-            # Try alternative URL if we got HTML instead of PDF
-            content_str = response.content.decode('utf-8', errors='ignore')
-            if 'Preparing to download' in content_str:
-                # Extract PMC ID and try Europe PMC service
-                import re
-                pmc_match = re.search(r'PMC\d+', pdf_url)
-                if pmc_match:
-                    pmc_id = pmc_match.group()
-                    alt_url = f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmc_id}&blobtype=pdf"
-                    print(f"** Trying alternative URL: {alt_url}")
-                    response = requests.get(alt_url, headers=headers, allow_redirects=True)
-                    response.raise_for_status()
-        
+            print(f"** Content from {pdf_url} is not a PDF (first bytes: {response.content[:20]})")
+            return False
+
         with open(f'{directory}/{name}.pdf', 'wb') as f:
             f.write(response.content)
         print(f"** Successfully fetched and saved PDF for PMCID {name}. File size: {len(response.content)} bytes")
+        return True
     except requests.RequestException as e:
         print(f"** Failed to download PDF from {pdf_url}: {e}")
+        return False
+
+def _save_pdf_from_tgz(tgz_url, directory, name, headers):
+    """Download a tar.gz from the PMC OA archive and extract the PDF."""
+    try:
+        print(f"** Downloading OA archive from {tgz_url}...")
+        response = requests.get(tgz_url, headers=headers, allow_redirects=True, timeout=120)
+        response.raise_for_status()
+
+        tar = tarfile.open(fileobj=io.BytesIO(response.content), mode='r:gz')
+        pdf_members = [m for m in tar.getmembers() if m.name.endswith('.pdf')]
+        if not pdf_members:
+            print(f"** No PDF found in OA archive from {tgz_url}")
+            return False
+
+        pdf_data = tar.extractfile(pdf_members[0]).read()
+        if not pdf_data.startswith(b'%PDF'):
+            print(f"** Extracted file is not a valid PDF")
+            return False
+
+        with open(f'{directory}/{name}.pdf', 'wb') as f:
+            f.write(pdf_data)
+        print(f"** Successfully extracted and saved PDF for PMCID {name}. File size: {len(pdf_data)} bytes")
+        return True
+    except Exception as e:
+        print(f"** Failed to extract PDF from OA archive: {e}")
+        return False
 
 def fetch(pmcid, finders, name, headers, error_pmids, args):
     uri = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid.strip()}"
@@ -53,9 +78,9 @@ def fetch(pmcid, finders, name, headers, error_pmids, args):
             print(f"Trying {finder}")
             pdf_url = eval(finder)(req, soup, headers)
             if pdf_url:
-                save_pdf_from_url(pdf_url, args['out'], name, headers)
-                success = True
-                break
+                if save_pdf_from_url(pdf_url, args['out'], name, headers):
+                    success = True
+                    break
 
         if not success:
             print(f"** Reprint {pmcid} could not be fetched with the current finders.")
@@ -122,14 +147,56 @@ def uchicago_press(req, soup, headers):
     return None
 
 def europe_pmc_service(req, soup, headers):
-    """Use Europe PMC service for reliable PDF downloads"""
-    # Extract PMC ID from the current URL
+    """Use Europe PMC service for PDF downloads"""
     pmc_match = re.search(r'PMC\d+', req.url)
     if pmc_match:
         pmc_id = pmc_match.group()
         print(f"** Fetching reprint using the 'Europe PMC Service' finder for {pmc_id}...")
         return f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmc_id}&blobtype=pdf"
     return None
+
+def pmc_direct_pdf(req, soup, headers):
+    """Try the direct PMC PDF URL pattern."""
+    pmc_match = re.search(r'PMC\d+', req.url)
+    if pmc_match:
+        pmc_id = pmc_match.group()
+        # Look for the PDF link in the page's download section
+        pdf_link = soup.find('a', attrs={'href': re.compile(rf'/pmc/articles/{pmc_id}/pdf/')})
+        if pdf_link:
+            pdf_url = f"https://www.ncbi.nlm.nih.gov{pdf_link.get('href')}"
+            print(f"** Fetching reprint using the 'PMC Direct PDF' finder for {pmc_id}...")
+            return pdf_url
+    return None
+
+def pmc_oa_service(req, soup, headers):
+    """Use the PMC Open Access web service to get the PDF from the OA archive.
+    This bypasses the PoW challenge on the PMC website by downloading
+    from the FTP/HTTPS archive directly."""
+    pmc_match = re.search(r'PMC\d+', req.url)
+    if not pmc_match:
+        return None
+
+    pmc_id = pmc_match.group()
+    print(f"** Trying 'PMC OA Service' finder for {pmc_id}...")
+
+    try:
+        oa_url = f"https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id={pmc_id}"
+        oa_resp = requests.get(oa_url, headers=headers, timeout=30)
+        oa_resp.raise_for_status()
+
+        oa_soup = BeautifulSoup(oa_resp.content, 'html.parser')
+        link = oa_soup.find('link', attrs={'format': 'tgz'})
+        if not link:
+            print(f"** {pmc_id} not found in PMC Open Access subset.")
+            return None
+
+        tgz_url = link.get('href', '')
+        # Convert FTP to HTTPS
+        tgz_url = tgz_url.replace('ftp://ftp.ncbi.nlm.nih.gov/', 'https://ftp.ncbi.nlm.nih.gov/')
+        return f"oa_tgz:{tgz_url}"
+    except requests.RequestException as e:
+        print(f"** PMC OA Service failed: {e}")
+        return None
 
 def main():
     parser = argparse.ArgumentParser()
@@ -175,14 +242,16 @@ def main():
             pmcids = [x[0] for x in pmcids]
 
     finders = [
-        'europe_pmc_service',
+        'pmc_oa_service',
+        'pmc_direct_pdf',
         'generic_citation_labelled',
         'pubmed_central_v2',
         'acs_publications',
         'uchicago_press',
         'nejm',
         'future_medicine',
-        'science_direct'
+        'science_direct',
+        'europe_pmc_service',
     ]
 
     batch_count = 0

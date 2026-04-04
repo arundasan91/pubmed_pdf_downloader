@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='pubmed_pdf_downloader',
-    version='0.1.0',
+    version='0.1.1',
     description='A package to download PDFs from PubMed Central using PMCIDs.',
     author='Arun Das',
     author_email='ard212@pitt.edu',
